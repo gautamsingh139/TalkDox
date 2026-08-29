@@ -1,0 +1,582 @@
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
+import re
+import os
+import tempfile
+
+from dotenv import load_dotenv
+from langchain_community.vectorstores import FAISS
+from langchain_google_genai import GoogleGenerativeAIEmbeddings  # embeddings only (Groq has no embeddings API)
+from langchain_groq import ChatGroq
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+import requests
+from bs4 import BeautifulSoup
+from youtube_transcript_api import YouTubeTranscriptApi
+
+from utils.pdf_processor import extract_text_from_pdfs
+from utils.ai_helpers import generate_document_dna, build_prompt, get_analytics, generate_chat_export
+from utils.agents import (
+    is_vague_query, get_clarification_question,
+    self_reflect_and_improve, apply_confidence_adaptation, get_confidence
+)
+
+load_dotenv()
+
+# Chat LLM model (Groq). Change in one place to swap models.
+CHAT_MODEL = "llama-3.3-70b-versatile"
+
+app = FastAPI()
+
+@app.get("/")
+async def root():
+    return {"message": "TalkDox Backend Running Successfully"}
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+store = {
+    "vectorstore": None,
+    "full_text": "",
+    "pdf_names": [],
+    "total_pages": 0,
+    "total_chunks": 0,
+    "dna": None,
+    "doc_language": "English",
+    "source_type": "pdf",
+    "chat_history": [],
+    "compare_vectorstore": None,
+    "compare_name": "",
+    "compare_full_text": "",
+    "dna_loading": False,
+}
+
+def index_text(text: str, source_label: str):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
+    chunks = splitter.split_text(text)
+    metas = [{"source": source_label, "page": i + 1} for i in range(len(chunks))]
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+    vs = FAISS.from_texts(chunks, embeddings, metadatas=metas)
+    return vs, len(chunks)
+
+
+@app.post("/api/upload/pdf")
+async def upload_pdf(files: list[UploadFile] = File(...)):
+    try:
+        import io
+        from pypdf import PdfReader
+        from docx import Document
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+        MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+        MAX_PAGES = 300
+
+        all_chunks, meta = [], []
+        total_pages = 0
+        full_text = ""
+
+        for f in files:
+            content = await f.read()
+            filename = f.filename.lower()
+
+            if len(content) > MAX_FILE_SIZE:
+                return JSONResponse(status_code=400, content={
+                    "error": "File is too large. Maximum size is 20 MB."
+                })
+
+            file_text = ""
+            page_count = 1
+            splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
+
+            # PDF
+            if filename.endswith('.pdf'):
+                pdf_bytes = io.BytesIO(content)
+                pdf = PdfReader(pdf_bytes)
+
+                if len(pdf.pages) > MAX_PAGES:
+                    return JSONResponse(status_code=400, content={
+                        "error": f"PDF has {len(pdf.pages)} pages. Maximum is {MAX_PAGES} pages."
+                    })
+
+                page_count = len(pdf.pages)
+                for i, page in enumerate(pdf.pages):
+                    text = page.extract_text() or ""
+                    file_text += text + "\n"
+                    if text.strip():
+                        chunks = splitter.split_text(text)
+                        for chunk in chunks:
+                            all_chunks.append(chunk)
+                            meta.append({"source": f.filename, "page": i + 1})
+
+            # DOCX (Word)
+            elif filename.endswith('.docx'):
+                doc_bytes = io.BytesIO(content)
+                doc = Document(doc_bytes)
+                file_text = "\n".join([p.text for p in doc.paragraphs if p.text.strip()])
+                if file_text.strip():
+                    chunks = splitter.split_text(file_text)
+                    for chunk in chunks:
+                        all_chunks.append(chunk)
+                        meta.append({"source": f.filename, "page": 1})
+
+            # TXT or MD (plain text)
+            elif filename.endswith(('.txt', '.md')):
+                file_text = content.decode('utf-8', errors='ignore')
+                if file_text.strip():
+                    chunks = splitter.split_text(file_text)
+                    for chunk in chunks:
+                        all_chunks.append(chunk)
+                        meta.append({"source": f.filename, "page": 1})
+
+            else:
+                return JSONResponse(status_code=400, content={
+                    "error": f"Unsupported file type: {f.filename}. Please upload PDF, DOCX, TXT, or MD files."
+                })
+
+            full_text += file_text + "\n"
+            total_pages += page_count
+
+        if not all_chunks:
+            return JSONResponse(status_code=400, content={
+                "error": "Couldn't extract any text from the file. It may be empty or corrupted."
+            })
+
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+        vs = FAISS.from_texts(all_chunks, embeddings, metadatas=meta)
+
+        store["vectorstore"]  = vs
+        store["full_text"]    = full_text
+        store["pdf_names"]    = [f.filename for f in files]
+        store["total_pages"]  = total_pages
+        store["total_chunks"] = len(all_chunks)
+        store["dna"]          = None
+        store["doc_language"] = "English"
+        store["source_type"]  = "pdf"
+        store["chat_history"] = []
+        store["dna_loading"]  = True
+
+        import asyncio
+        asyncio.create_task(generate_dna_background(full_text))
+
+        return {
+            "success": True,
+            "pdf_names": store["pdf_names"],
+            "total_pages": total_pages,
+            "total_chunks": len(all_chunks),
+            "dna": None,
+            "doc_language": "English",
+            "source_type": "pdf"
+        }
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+async def generate_dna_background(full_text):
+    try:
+        llm = ChatGroq(model=CHAT_MODEL, temperature=0.2)
+        dna = generate_document_dna(full_text, llm)
+        if dna:
+            store["dna"] = dna
+            store["doc_language"] = dna.get("language", "English")
+        store["dna_loading"] = False
+    except Exception:
+        store["dna_loading"] = False
+
+
+@app.post("/api/upload/web")
+async def upload_web(url: str = Form(...)):
+    try:
+        import random
+        
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ]
+        
+        headers = {
+            "User-Agent": random.choice(user_agents),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9,en-IN;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+        }
+        
+        try:
+            resp = requests.get(url, headers=headers, timeout=15, allow_redirects=True)
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code
+            if status == 403:
+                return JSONResponse(status_code=400, content={
+                    "error": "This website blocks automated access. Try blogs, Wikipedia, documentation sites, or paste content into a PDF instead."
+                })
+            elif status == 404:
+                return JSONResponse(status_code=400, content={
+                    "error": "Page not found. Please check the URL and try again."
+                })
+            elif status == 429:
+                return JSONResponse(status_code=400, content={
+                    "error": "Too many requests. Please wait a moment and try again."
+                })
+            elif status == 401:
+                return JSONResponse(status_code=400, content={
+                    "error": "This page requires login and can't be accessed publicly."
+                })
+            else:
+                return JSONResponse(status_code=400, content={
+                    "error": f"Couldn't fetch this page (error {status}). The site may be blocking access."
+                })
+        except requests.exceptions.Timeout:
+            return JSONResponse(status_code=400, content={
+                "error": "Request timed out. The website is too slow or unreachable."
+            })
+        except requests.exceptions.ConnectionError:
+            return JSONResponse(status_code=400, content={
+                "error": "Couldn't connect to this website. Please check the URL."
+            })
+        
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script","style","nav","footer","header","aside","form","iframe","noscript"]):
+            tag.decompose()
+        title = soup.title.string.strip() if soup.title else url
+        texts = []
+        for tag in soup.find_all(["p","h1","h2","h3","h4","li","article","section","blockquote"]):
+            t = tag.get_text(" ", strip=True)
+            if len(t) > 40:
+                texts.append(t)
+        full_text = "\n\n".join(texts)
+        if len(full_text.strip()) < 200:
+            return JSONResponse(status_code=400, content={
+                "error": "Not enough readable content on this page. The site may use JavaScript rendering or block scrapers."
+            })
+
+        vs, chunk_count = index_text(full_text, title)
+        store["vectorstore"]  = vs
+        store["full_text"]    = full_text
+        store["pdf_names"]    = [title]
+        store["total_pages"]  = 1
+        store["total_chunks"] = chunk_count
+        store["dna"]          = None
+        store["doc_language"] = "English"
+        store["source_type"]  = "web"
+        store["chat_history"] = []
+
+        return {"success": True, "title": title, "total_chunks": chunk_count, "source_type": "web"}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "error": "Something went wrong while fetching this page. Please try a different URL."
+        })
+
+
+@app.post("/api/upload/youtube")
+async def upload_youtube(url: str = Form(...)):
+    try:
+        import httpx
+        import os
+
+        m = re.search(r"(?:v=|youtu\.be/|embed/|shorts/)([a-zA-Z0-9_-]{11})", url)
+        if not m:
+            return JSONResponse(status_code=400, content={"error": "That doesn't look like a valid YouTube URL. Please paste the full video link."})
+        video_id = m.group(1)
+
+        api_key = os.getenv("SUPADATA_API_KEY")
+        if not api_key:
+            return JSONResponse(status_code=500, content={
+                "error": "Server configuration issue. Please contact support."
+            })
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(
+                "https://api.supadata.ai/v1/youtube/transcript",
+                params={"videoId": video_id, "text": "true"},
+                headers={"x-api-key": api_key}
+            )
+
+        if r.status_code != 200:
+            raw_error = ""
+            try:
+                error_data = r.json()
+                raw_error = (error_data.get("message", "") or error_data.get("error", "") or "").lower()
+            except:
+                raw_error = r.text.lower()
+
+            if "region" in raw_error or "geographical" in raw_error or "not available in your" in raw_error:
+                friendly = "This video is region-locked and can't be accessed. Please try a different video."
+            elif "private" in raw_error or "unavailable" in raw_error:
+                friendly = "This video is private or has been removed. Please try a different one."
+            elif "caption" in raw_error or "transcript" in raw_error or "subtitle" in raw_error:
+                friendly = "This video doesn't have captions enabled. Try a video that has subtitles available."
+            elif "age" in raw_error or "restricted" in raw_error:
+                friendly = "This video is age-restricted and can't be processed. Please try another one."
+            elif "live" in raw_error or "stream" in raw_error:
+                friendly = "Live streams can't be processed. Please use a regular YouTube video."
+            elif r.status_code == 401 or r.status_code == 403:
+                friendly = "This video can't be accessed right now. It may be region-locked, private, or have captions disabled."
+            elif r.status_code == 404:
+                friendly = "Video not found. Please check the URL and try again."
+            elif r.status_code == 429:
+                friendly = "Too many requests right now. Please wait a moment and try again."
+            else:
+                friendly = "Couldn't extract this video's transcript. Try a different video with captions enabled."
+
+            return JSONResponse(status_code=400, content={"error": friendly})
+
+        data = r.json()
+
+        full_text = ""
+        if isinstance(data.get("content"), str):
+            full_text = data["content"]
+        elif isinstance(data.get("content"), list):
+            full_text = " ".join([item.get("text", "") for item in data["content"]])
+        elif isinstance(data.get("transcript"), list):
+            full_text = " ".join([item.get("text", "") for item in data["transcript"]])
+
+        if not full_text or len(full_text.strip()) < 100:
+            return JSONResponse(status_code=400, content={
+                "error": "This video doesn't seem to have enough content in its captions. Try a video with a longer transcript."
+            })
+
+        vs, chunk_count = index_text(full_text, f"youtube/{video_id}")
+
+        store["vectorstore"]  = vs
+        store["full_text"]    = full_text
+        store["pdf_names"]    = [f"YouTube: {url[:50]}"]
+        store["total_pages"]  = 1
+        store["total_chunks"] = chunk_count
+        store["dna"]          = None
+        store["doc_language"] = "English"
+        store["source_type"]  = "youtube"
+        store["chat_history"] = []
+
+        return {
+            "success": True,
+            "video_id": video_id,
+            "duration": "N/A",
+            "total_chunks": chunk_count,
+            "source_type": "youtube"
+        }
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={
+            "error": "Something went wrong while fetching the transcript. Please try again."
+        })
+
+
+@app.post("/api/chat")
+async def chat(
+    question: str = Form(...),
+    mode: str = Form("qa"),
+    persona: str = Form("default")
+):
+    try:
+        if not store["vectorstore"]:
+            return JSONResponse(status_code=400, content={"error": "No document loaded."})
+
+        if is_vague_query(question):
+            clarification = get_clarification_question(question)
+            store["chat_history"].append({"role": "user", "content": question})
+            store["chat_history"].append({"role": "assistant", "content": f"🤔 {clarification}", "sources": [], "confidence": None})
+            return {"answer": f"🤔 {clarification}", "sources": [], "confidence": None, "vague": True}
+
+        docs = store["vectorstore"].similarity_search(question, k=5)
+        context = "\n\n".join([d.page_content for d in docs])
+        sources = list(set([f"{d.metadata['source']} p.{d.metadata['page']}" for d in docs]))
+        confidence = get_confidence(docs, question)
+
+        llm = ChatGroq(model=CHAT_MODEL, temperature=0.2)
+        prompt = build_prompt(question, context, store["chat_history"], mode, persona, store["doc_language"])
+        initial = llm.invoke(prompt).content
+        answer = self_reflect_and_improve(question, context, initial, llm)
+        answer = apply_confidence_adaptation(answer, confidence)
+
+        store["chat_history"].append({"role": "user", "content": question})
+        store["chat_history"].append({"role": "assistant", "content": answer, "sources": sources, "confidence": confidence})
+
+        return {"answer": answer, "sources": sources, "confidence": confidence, "vague": False}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/dna")
+async def get_dna():
+    return {"dna": store["dna"]}
+
+
+@app.post("/api/tools")
+async def run_tool(tool: str = Form(...)):
+    try:
+        llm = ChatGroq(model=CHAT_MODEL, temperature=0.3)
+        sample = store["full_text"][:4000]
+        lang = store["doc_language"]
+        lang_note = f" Respond in {lang}." if lang != "English" else ""
+
+        prompts = {
+            "summary": f"Create a structured summary: 1) Overview 2) Key Points 3) Important Details 4) Conclusion.{lang_note}\n\nDocument:\n{sample}",
+            "quiz": f"Generate 5 multiple-choice quiz questions with 4 options (A-D), mark correct answer.{lang_note}\n\nDocument:\n{sample}",
+            "email": f"Draft a professional email. Include subject line, greeting, body, call to action.{lang_note}\n\nDocument:\n{sample}",
+            "contradictions": f"Find contradictions or inconsistencies. Be specific. If none, say so.{lang_note}\n\nDocument:\n{sample}",
+            "actions": f"Extract all action items as a numbered checklist with owner and priority.{lang_note}\n\nDocument:\n{sample}"
+        }
+
+        if tool not in prompts:
+            return JSONResponse(status_code=400, content={"error": "Unknown tool."})
+
+        result = llm.invoke(prompts[tool]).content
+        return {"result": result}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/api/timeline")
+async def get_timeline():
+    try:
+        import json as jsonlib
+        llm = ChatGroq(model=CHAT_MODEL, temperature=0.1)
+        sample = store["full_text"][:6000]
+        prompt = f"""Extract ALL dates and events. Return ONLY valid JSON array:
+[{{"date":"...","sort_key":"YYYY-MM-DD","event":"...","type":"deadline/milestone/event/period/announcement/other","importance":"high/medium/low"}}]
+If none found return [].
+Document: {sample}"""
+        response = llm.invoke(prompt).content.strip()
+        response = re.sub(r"```json|```", "", response).strip()
+        start = response.find("[")
+        end = response.rfind("]") + 1
+        data = jsonlib.loads(response[start:end])
+        return {"timeline": sorted(data, key=lambda x: x.get("sort_key", "9999"))}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+
+@app.post("/api/flashcards")
+async def get_flashcards(count: int = Form(10)):
+    try:
+        import json as jsonlib
+        llm = ChatGroq(model=CHAT_MODEL, temperature=0.4)
+        sample = store["full_text"][:5000]
+        prompt = f"""Generate exactly {count} flashcards. Return ONLY valid JSON array:
+[{{"question":"...","answer":"...","difficulty":"easy/medium/hard","topic":"..."}}]
+Mix difficulty levels. Do NOT number questions.
+Material: {sample}"""
+        response = llm.invoke(prompt).content.strip()
+        response = re.sub(r"```json|```", "", response).strip()
+        start = response.find("[")
+        end = response.rfind("]") + 1
+        cards = jsonlib.loads(response[start:end])
+        return {"flashcards": cards}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/api/compare/upload")
+async def upload_compare(files: list[UploadFile] = File(...)):
+    try:
+        import io
+        # Subclass BytesIO so PdfReader gets a real seekable stream (read/seek/tell),
+        # while still carrying a .name for source metadata.
+        class FileWrapper(io.BytesIO):
+            def __init__(self, content, name):
+                super().__init__(content)
+                self.name = name
+
+        f = files[0]
+        content = await f.read()
+        wrapped = [FileWrapper(content, f.filename)]
+        chunks, metas, pages, full_text = extract_text_from_pdfs(wrapped)
+        embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
+        vs = FAISS.from_texts(chunks, embeddings, metadatas=metas)
+        store["compare_vectorstore"] = vs
+        store["compare_name"] = f.filename
+        store["compare_full_text"] = full_text
+        return {"success": True, "name": f.filename}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/api/compare/chat")
+async def compare_chat(question: str = Form(...)):
+    try:
+        if not store["vectorstore"] or not store["compare_vectorstore"]:
+            return JSONResponse(status_code=400, content={"error": "Both documents required."})
+
+        docs_a = store["vectorstore"].similarity_search(question, k=4)
+        docs_b = store["compare_vectorstore"].similarity_search(question, k=4)
+        context_a = "\n\n".join([d.page_content for d in docs_a])
+        context_b = "\n\n".join([d.page_content for d in docs_b])
+        sources_a = list(set([f"{d.metadata['source']} p.{d.metadata['page']}" for d in docs_a]))
+        sources_b = list(set([f"{d.metadata['source']} p.{d.metadata['page']}" for d in docs_b]))
+
+        doc_a = store["pdf_names"][0] if store["pdf_names"] else "Document A"
+        doc_b = store["compare_name"]
+
+        prompt = f"""You are performing a side-by-side document comparison.
+
+Document A ({doc_a}): {context_a}
+Document B ({doc_b}): {context_b}
+
+Question: {question}
+Answer specifically, label Document A / Document B clearly."""
+
+        llm = ChatGroq(model=CHAT_MODEL, temperature=0.2)
+        answer = llm.invoke(prompt).content
+
+        return {"answer": answer, "sources_a": sources_a, "sources_b": sources_b}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.get("/api/analytics")
+async def analytics():
+    return get_analytics(store["chat_history"])
+
+
+@app.get("/api/state")
+async def get_state():
+    return {
+        "processed": store["vectorstore"] is not None,
+        "source_type": store["source_type"],
+        "pdf_names": store["pdf_names"],
+        "total_pages": store["total_pages"],
+        "total_chunks": store["total_chunks"],
+        "doc_language": store["doc_language"],
+        "dna": store["dna"],
+        "chat_history": store["chat_history"],
+        "compare_loaded": store["compare_vectorstore"] is not None,
+        "compare_name": store["compare_name"],
+    }
+
+
+@app.post("/api/reset")
+async def reset():
+    for k in store:
+        if k in ["vectorstore", "compare_vectorstore"]:
+            store[k] = None
+        elif k in ["chat_history"]:
+            store[k] = []
+        elif k in ["total_pages", "total_chunks"]:
+            store[k] = 0
+        else:
+            store[k] = ""
+    store["source_type"] = "pdf"
+    return {"success": True}
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
