@@ -6,7 +6,7 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': 'https://gautamsingh-talkdox-backend.hf.space'
+      '/api': 'https://gautamsingh139-talkdox-backend.hf.space'
     }
   }
 })
