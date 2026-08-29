@@ -3,7 +3,7 @@
 > Chat with any **document**, **website**, or **YouTube video** - powered by Google Gemini 2.5 Flash.  
 > Agentic RAG with 12+ AI features in one unified intelligence layer.
 
-[![Live Demo](https://img.shields.io/badge/Live_Demo-talkdox--ai.vercel.app-black?style=for-the-badge)](https://talkdox-ai.vercel.app)
+
 [![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
 ---
